@@ -87,8 +87,10 @@ class Vs2010Backend(backends.Backend):
         self.vs_version = '2010'
         self.windows_target_platform_version = None
         self.subdirs = {}
+        self.target_filter_subdirs = {}
+        self.write_filters = self.environment.coredata.get_builtin_option('layout') == 'mirror'
 
-    def generate_custom_generator_commands(self, target, parent_node):
+    def generate_custom_generator_commands(self, target, parent_node, parent_node_filt):
         generator_output_files = []
         custom_target_include_dirs = []
         custom_target_output_files = []
@@ -111,6 +113,7 @@ class Vs2010Backend(backends.Backend):
                 source_dir = os.path.join(down, self.build_to_src, genlist.subdir)
                 exe_arr = self.exe_object_to_cmd_array(exe)
                 idgroup = ET.SubElement(parent_node, 'ItemGroup')
+                idgroup_filt = ET.SubElement(parent_node_filt, 'ItemGroup')
                 for i in range(len(infilelist)):
                     if len(infilelist) == len(outfilelist):
                         sole_output = os.path.join(target_private_dir, outfilelist[i])
@@ -146,6 +149,8 @@ class Vs2010Backend(backends.Backend):
                         abs_pdir = os.path.join(self.environment.get_build_dir(), self.get_target_dir(target))
                         os.makedirs(abs_pdir, exist_ok=True)
                     cbs = ET.SubElement(idgroup, 'CustomBuild', Include=infilename)
+                    self.add_filter_element(target, curfile, idgroup_filt, 'CustomBuild', Include=infilename)
+
                     ET.SubElement(cbs, 'Command').text = ' '.join(self.quote_arguments(cmd))
                     ET.SubElement(cbs, 'Outputs').text = ';'.join(outfiles)
         return generator_output_files, custom_target_output_files, custom_target_include_dirs
@@ -290,7 +295,7 @@ class Vs2010Backend(backends.Backend):
             prj_templ = 'Project("{%s}") = "%s", "%s", "{%s}"\n'
             for prj in projlist:
                 coredata = self.environment.coredata
-                if coredata.get_builtin_option('layout') == 'mirror':
+                if self.write_filters:
                     self.generate_solution_dirs(ofile, prj[1].parents)
                 target = self.build.targets[prj[0]]
                 lang = 'default'
@@ -454,6 +459,8 @@ class Vs2010Backend(backends.Backend):
         root = ET.Element('Project', {'DefaultTargets': "Build",
                                       'ToolsVersion': '4.0',
                                       'xmlns': 'http://schemas.microsoft.com/developer/msbuild/2003'})
+        root_filt = ET.Element('Project', {'ToolsVersion': '4.0',
+                                         'xmlns': 'http://schemas.microsoft.com/developer/msbuild/2003'})
         confitems = ET.SubElement(root, 'ItemGroup', {'Label': 'ProjectConfigurations'})
         prjconf = ET.SubElement(confitems, 'ProjectConfiguration',
                                 {'Include': self.buildtype + '|' + self.platform})
@@ -489,7 +496,7 @@ class Vs2010Backend(backends.Backend):
         intdir.text = target.get_id() + '\\'
         tname = ET.SubElement(direlem, 'TargetName')
         tname.text = target.name
-        return root
+        return root, root_filt
 
     def gen_run_target_vcxproj(self, target, ofname, guid):
         root = self.create_basic_crap(target, guid)
@@ -518,7 +525,7 @@ class Vs2010Backend(backends.Backend):
         self._prettyprint_vcxproj_xml(ET.ElementTree(root), ofname)
 
     def gen_custom_target_vcxproj(self, target, ofname, guid):
-        root = self.create_basic_crap(target, guid)
+        root, root_filt = self.create_basic_crap(target, guid)
         action = ET.SubElement(root, 'ItemDefinitionGroup')
         customstep = ET.SubElement(action, 'CustomBuildStep')
         # We need to always use absolute paths because our invocation is always
@@ -541,8 +548,9 @@ class Vs2010Backend(backends.Backend):
         ET.SubElement(customstep, 'Outputs').text = ';'.join(ofilenames)
         ET.SubElement(customstep, 'Inputs').text = ';'.join([exe_data] + srcs + depend_files)
         ET.SubElement(root, 'Import', Project='$(VCTargetsPath)\Microsoft.Cpp.targets')
-        self.generate_custom_generator_commands(target, root)
+        self.generate_custom_generator_commands(target, root, root_filt)
         self._prettyprint_vcxproj_xml(ET.ElementTree(root), ofname)
+        self.print_vcxproj_filters_xml(target, root_filt, ofname)
 
     @classmethod
     def lang_from_source_file(cls, src):
@@ -688,6 +696,35 @@ class Vs2010Backend(backends.Backend):
             of.write(doc.toprettyxml())
         replace_if_different(ofname, ofname_tmp)
 
+    def get_file_filter(self, target, source):
+        path = source.fname if hasattr(source, 'fname') else source
+        folder = str(PurePath(path).parent)
+        result = folder if folder != '.' else ''
+        if result != '':
+            name = target.name
+            if not name in self.target_filter_subdirs:
+                self.target_filter_subdirs[name] = set()
+            self.target_filter_subdirs[name].add(result)
+        return result
+
+    def add_filter_element(self, target, source, group_elem, tag, **extra):
+        elem = ET.SubElement(group_elem, tag, extra)
+        value = self.get_file_filter(target, source)
+        if value != '':
+            ET.SubElement(elem, 'Filter').text = value
+
+    def print_vcxproj_filters_xml(self, target, root_filt, ofname):
+        if not self.write_filters:
+            return
+        name = target.name
+        if name in self.target_filter_subdirs:
+            guids = ET.SubElement(root_filt, 'ItemGroup')
+            for path in self.target_filter_subdirs[name]:
+                filt = ET.SubElement(guids, 'Filter', Include=path)
+                guid = ET.SubElement(filt, 'UniqueIdentifier')
+                guid.text = generate_guid_from_path(path, 'filter')
+        self._prettyprint_vcxproj_xml(ET.ElementTree(root_filt), ofname + '.filters')
+
     def gen_vcxproj(self, target, ofname, guid):
         mlog.debug('Generating vcxproj %s.' % target.name)
         entrypoint = 'WinMainCRTStartup'
@@ -726,6 +763,8 @@ class Vs2010Backend(backends.Backend):
         root = ET.Element('Project', {'DefaultTargets': "Build",
                                       'ToolsVersion': '4.0',
                                       'xmlns': 'http://schemas.microsoft.com/developer/msbuild/2003'})
+        root_filt = ET.Element('Project', {'ToolsVersion': '4.0',
+                                         'xmlns': 'http://schemas.microsoft.com/developer/msbuild/2003'})
         confitems = ET.SubElement(root, 'ItemGroup', {'Label': 'ProjectConfigurations'})
         prjconf = ET.SubElement(confitems, 'ProjectConfiguration',
                                 {'Include': self.buildtype + '|' + self.platform})
@@ -821,7 +860,7 @@ class Vs2010Backend(backends.Backend):
             ET.SubElement(type_config, 'Optimization').text = 'Disabled'
         # End configuration
         ET.SubElement(root, 'Import', Project='$(VCTargetsPath)\Microsoft.Cpp.props')
-        generated_files, custom_target_output_files, generated_files_include_dirs = self.generate_custom_generator_commands(target, root)
+        generated_files, custom_target_output_files, generated_files_include_dirs = self.generate_custom_generator_commands(target, root, root_filt)
         (gen_src, gen_hdrs, gen_objs, gen_langs) = self.split_sources(generated_files)
         (custom_src, custom_hdrs, custom_objs, custom_langs) = self.split_sources(custom_target_output_files)
         gen_src += custom_src
@@ -854,6 +893,7 @@ class Vs2010Backend(backends.Backend):
         file_args = dict((lang, CompilerArgs(comp)) for lang, comp in target.compilers.items())
         file_defines = dict((lang, []) for lang in target.compilers)
         file_inc_dirs = dict((lang, []) for lang in target.compilers)
+
         # The order in which these compile args are added must match
         # generate_single_compile() and generate_basic_compiler_args()
         for l, comp in target.compilers.items():
@@ -1133,44 +1173,62 @@ class Vs2010Backend(backends.Backend):
         else:
             raise MesonException('Unsupported Visual Studio target machine: ' + targetplatform)
 
+        meson_file_path = os.path.join(proj_to_src_dir, build_filename)
         meson_file_group = ET.SubElement(root, 'ItemGroup')
-        ET.SubElement(meson_file_group, 'None', Include=os.path.join(proj_to_src_dir, build_filename))
+        meson_file_group_filt = ET.SubElement(root_filt, 'ItemGroup')
+        ET.SubElement(meson_file_group, 'None', Include=meson_file_path)
+        self.add_filter_element(target, build_filename, meson_file_group_filt, 'None', Include=meson_file_path)
 
         extra_files = target.extra_files
         if len(headers) + len(gen_hdrs) + len(extra_files) > 0:
             inc_hdrs = ET.SubElement(root, 'ItemGroup')
+            inc_hdrs_filt = ET.SubElement(root_filt, 'ItemGroup')
             for h in headers:
                 relpath = os.path.join(down, h.rel_to_builddir(self.build_to_src))
                 ET.SubElement(inc_hdrs, 'CLInclude', Include=relpath)
+                self.add_filter_element(target, h, inc_hdrs_filt, 'CLInclude', Include=relpath)
+
             for h in gen_hdrs:
                 ET.SubElement(inc_hdrs, 'CLInclude', Include=h)
+                self.add_filter_element(target, h, inc_hdrs_filt, 'CLInclude', Include=h)
+
             for h in target.extra_files:
                 relpath = os.path.join(down, h.rel_to_builddir(self.build_to_src))
                 ET.SubElement(inc_hdrs, 'CLInclude', Include=relpath)
+                self.add_filter_element(target, h, inc_hdrs_filt, 'CLInclude', Include=relpath)
 
         if len(sources) + len(gen_src) + len(pch_sources) > 0:
             inc_src = ET.SubElement(root, 'ItemGroup')
+            inc_src_filt = ET.SubElement(root_filt, 'ItemGroup')
             for s in sources:
                 relpath = os.path.join(down, s.rel_to_builddir(self.build_to_src))
                 inc_cl = ET.SubElement(inc_src, 'CLCompile', Include=relpath)
+                self.add_filter_element(target, s, inc_src_filt, 'CLCompile', Include=relpath)
+
                 lang = Vs2010Backend.lang_from_source_file(s)
                 self.add_pch(inc_cl, proj_to_src_dir, pch_sources, s)
                 self.add_additional_options(lang, inc_cl, file_args)
                 self.add_preprocessor_defines(lang, inc_cl, file_defines)
                 self.add_include_dirs(lang, inc_cl, file_inc_dirs)
                 ET.SubElement(inc_cl, 'ObjectFileName').text = "$(IntDir)" + self.object_filename_from_source(target, s)
+
             for s in gen_src:
                 inc_cl = ET.SubElement(inc_src, 'CLCompile', Include=s)
+                self.add_filter_element(target, s, inc_src_filt, 'CLCompile', Include=s)
+
                 lang = Vs2010Backend.lang_from_source_file(s)
                 self.add_pch(inc_cl, proj_to_src_dir, pch_sources, s)
                 self.add_additional_options(lang, inc_cl, file_args)
                 self.add_preprocessor_defines(lang, inc_cl, file_defines)
                 self.add_include_dirs(lang, inc_cl, file_inc_dirs)
+
             for lang in pch_sources:
                 header, impl, suffix = pch_sources[lang]
                 if impl:
                     relpath = os.path.join(proj_to_src_dir, impl)
                     inc_cl = ET.SubElement(inc_src, 'CLCompile', Include=relpath)
+                    self.add_filter_element(target, impl, inc_src_filt, 'CLCompile', Include=relpath)
+
                     pch = ET.SubElement(inc_cl, 'PrecompiledHeader')
                     pch.text = 'Create'
                     pch_out = ET.SubElement(inc_cl, 'PrecompiledHeaderOutputFile')
@@ -1185,11 +1243,14 @@ class Vs2010Backend(backends.Backend):
 
         if self.has_objects(objects, additional_objects, gen_objs):
             inc_objs = ET.SubElement(root, 'ItemGroup')
+            inc_objs_filt = ET.SubElement(root_filt)
             for s in objects:
                 relpath = os.path.join(down, s.rel_to_builddir(self.build_to_src))
                 ET.SubElement(inc_objs, 'Object', Include=relpath)
+                self.add_filter_element(target, s, inc_objs_filt, 'Object', Include=relpath)
             for s in additional_objects:
                 ET.SubElement(inc_objs, 'Object', Include=s)
+                self.add_filter_element(target, s, inc_objs_filt, 'Object', Include=s)
             self.add_generated_objects(inc_objs, gen_objs)
 
         ET.SubElement(root, 'Import', Project='$(VCTargetsPath)\Microsoft.Cpp.targets')
@@ -1197,6 +1258,7 @@ class Vs2010Backend(backends.Backend):
         regen_vcxproj = os.path.join(self.environment.get_build_dir(), 'REGEN.vcxproj')
         self.add_project_reference(root, regen_vcxproj, self.environment.coredata.regen_guid)
         self._prettyprint_vcxproj_xml(ET.ElementTree(root), ofname)
+        self.print_vcxproj_filters_xml(target, root_filt, ofname)
 
     def gen_regenproj(self, project_name, ofname):
         root = ET.Element('Project', {'DefaultTargets': 'Build',
